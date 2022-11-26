@@ -1,7 +1,7 @@
 #include <Utilities.h>
 using namespace RE;
-using std::unordered_map;
 using std::queue;
+using std::unordered_map;
 
 PlayerCharacter* p;
 ConsoleLog* clog;
@@ -9,20 +9,20 @@ REL::Relocation<uintptr_t> ptr_PCUpdateMainThread{ REL::ID(633524), 0x22D };
 REL::Relocation<uintptr_t> ptr_MainRenderAEnd{ REL::ID(1316702), 0xD0 };
 uintptr_t PCUpdateMainThreadOrig;
 uintptr_t MainRenderAEndOrig;
-uintptr_t MemFSVtable = 0;
 uintptr_t LooseFSVtable = 0;
 uintptr_t LooseFASVtable = 0;
 const static float stutterThreshold = 0.04f;
-const static int maxQueue = 5;
-const static int maxSample = 10;
+const static size_t maxQueue = 5;
+const static size_t maxSample = 10;
 static int sampleCount = 0;
 static float deltaAvg = 0.f;
 static float lastRun;
 static queue<std::pair<std::string, float>> lastFileLoaded;
 static queue<float> deltaQueue;
 
-char consolebuf[8192] = { 0 };
-void PrintConsole(const char* fmt, ...) {
+char consolebuf[1024] = { 0 };
+void PrintConsole(const char* fmt, ...)
+{
 	if (clog) {
 		va_list args;
 
@@ -34,17 +34,18 @@ void PrintConsole(const char* fmt, ...) {
 	}
 }
 
-class FileStreamWatcher {
+class FileStreamWatcher
+{
 public:
-	typedef uint32_t (FileStreamWatcher::* FnDoOpen)();
-	uint32_t HookedDoOpen() {
+	typedef uint32_t (FileStreamWatcher::*FnDoOpen)();
+	uint32_t HookedDoOpen()
+	{
 		std::string filename;
 		uintptr_t vtable = *(uint64_t*)this;
-		if (vtable == MemFSVtable || vtable == LooseFSVtable) {
+		if (vtable == LooseFSVtable) {
 			F4::BSResource::Stream* stream = (F4::BSResource::Stream*)this;
 			filename = std::string(stream->prefix) + std::string(stream->name);
-		}
-		else {
+		} else {
 			F4::BSResource::AsyncStream* stream = (F4::BSResource::AsyncStream*)this;
 			filename = std::string(stream->prefix) + std::string(stream->name);
 		}
@@ -53,10 +54,11 @@ public:
 			lastFileLoaded.pop();
 		}
 		FnDoOpen fn = fnHash.at(vtable);
-		return fn ? (this->*fn)() : 1;
+		return fn ? (this->*fn)() : 2;
 	}
 
-	void HookSink(uint64_t vtable) {
+	void HookSink(uint64_t vtable)
+	{
 		auto it = fnHash.find(vtable);
 		if (it == fnHash.end()) {
 			FnDoOpen fn = SafeWrite64Function(vtable + 0x8, &FileStreamWatcher::HookedDoOpen);
@@ -65,12 +67,48 @@ public:
 	}
 
 	F4_HEAP_REDEFINE_NEW(FileStreamWatcher);
+
 protected:
 	static std::unordered_map<uint64_t, FnDoOpen> fnHash;
 };
 std::unordered_map<uint64_t, FileStreamWatcher::FnDoOpen> FileStreamWatcher::fnHash;
 
-void HookedMainRenderAEnd(void* ptr) {
+void HookedUpdate(void* ptr)
+{
+	typedef void (*FnUpdate)();
+	FnUpdate fn = (FnUpdate)PCUpdateMainThreadOrig;
+	if (fn)
+		(*fn)();
+
+	float curtime = *F4::ptr_engineTime;
+	float deltaTime = *F4::ptr_deltaTime;
+	deltaQueue.push(deltaTime);
+	deltaAvg = deltaAvg * sampleCount + deltaTime;
+	if (sampleCount < maxSample) {
+		++sampleCount;
+	} else {
+		deltaAvg -= deltaQueue.front();
+		deltaQueue.pop();
+	}
+	deltaAvg /= sampleCount;
+
+	if (deltaTime - deltaAvg >= stutterThreshold) {
+		PrintConsole("Stutter occured at %f secs. Tick Avg : %f. Tick Hit : %f", curtime, round(1.f / deltaAvg), round(1.f / deltaTime));
+		_MESSAGE("Stutter occured at %f secs. Tick Avg : %f. Tick Hit : %f", curtime, round(1.f / deltaAvg), round(1.f / deltaTime));
+		queue<std::pair<std::string, float>> tempQueue = lastFileLoaded;
+		lastFileLoaded = queue<std::pair<std::string, float>>();
+		size_t currentSize = tempQueue.size();
+		for (int i = 0; i < currentSize; ++i) {
+			std::pair<std::string, float> fileInfo = tempQueue.front();
+			PrintConsole("File %s loaded on %f secs", fileInfo.first.c_str(), fileInfo.second);
+			_MESSAGE("File %s loaded on %f secs", fileInfo.first.c_str(), fileInfo.second);
+			tempQueue.pop();
+		}
+	}
+	lastRun = curtime;
+}
+
+/*void HookedMainRenderAEnd(void* ptr) {
 	float curtime = *F4::ptr_engineTime;
 
 	float deltaTime = curtime - lastRun;
@@ -101,14 +139,13 @@ void HookedMainRenderAEnd(void* ptr) {
 	FnUpdate fn = (FnUpdate)MainRenderAEndOrig;
 	if (fn)
 		(*fn)(ptr);
-}
+}*/
 
-void InitializePlugin() {
+void InitializePlugin()
+{
 	p = PlayerCharacter::GetSingleton();
 	clog = ConsoleLog::GetSingleton();
 	FileStreamWatcher* FSWatcher = new FileStreamWatcher();
-	MemFSVtable = REL::Relocation<uint64_t>{ VTABLE::BSResource__MemoryFileStream[0] }.address();
-	FSWatcher->HookSink(MemFSVtable);
 	LooseFSVtable = REL::Relocation<uint64_t>{ VTABLE::BSResource____LooseFileStream[0] }.address();
 	FSWatcher->HookSink(LooseFSVtable);
 	LooseFASVtable = REL::Relocation<uint64_t>{ VTABLE::BSResource____LooseFileAsyncStream[0] }.address();
@@ -167,8 +204,8 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 	F4SE::Init(a_f4se);
 
 	F4SE::Trampoline& trampoline = F4SE::GetTrampoline();
-	//PCUpdateMainThreadOrig = trampoline.write_call<5>(ptr_MainRenderAEnd.address(), &HookedUpdate);
-	MainRenderAEndOrig = (uintptr_t)SafeWrite64Function(ptr_MainRenderAEnd.address(), &HookedMainRenderAEnd);
+	PCUpdateMainThreadOrig = trampoline.write_call<5>(ptr_PCUpdateMainThread.address(), &HookedUpdate);
+	//MainRenderAEndOrig = (uintptr_t)SafeWrite64Function(ptr_MainRenderAEnd.address(), &HookedMainRenderAEnd);
 
 	const F4SE::MessagingInterface* message = F4SE::GetMessagingInterface();
 	message->RegisterListener([](F4SE::MessagingInterface::Message* msg) -> void {
